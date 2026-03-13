@@ -1,0 +1,6 @@
+data/raw/
+data/cleaned/
+data/profiles/
+__pycache__/
+*.pyc
+.DS_Store
