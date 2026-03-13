@@ -39,8 +39,17 @@ import textwrap
 from pathlib import Path
 from datetime import datetime
 
+import re as _re
 import pandas as pd
 import numpy as np
+
+# Regex for column names that are genuinely temporal.
+# Matches: ends with _at (created_at, updated_at), OR contains "date"/"timestamp"/"time"
+# as a standalone word segment (order_date, timestamp_utc, hire_date).
+# Does NOT match: customer_attr_1, price_attr_2, emp_attr_3 (no word-boundary _at at end).
+_TEMPORAL_COL = _re.compile(
+    r'(?:^|_)(?:date|timestamp|time)(?:_|$)|_at$'
+)
 
 # ── Optional: load .env file if present ───────────────────────────────────
 try:
@@ -114,8 +123,11 @@ def pandas_dtype_to_sf(col_name: str, dtype, sample_series: pd.Series) -> str:
     """
     col_lower = col_name.lower()
 
-    # Datetime columns
-    if dtype == "datetime64[ns]" or "date" in col_lower or "timestamp" in col_lower or "_at" in col_lower:
+    # Datetime columns — use _TEMPORAL_COL (module-level regex) to avoid false
+    # matches like "customer_attr_1" (contains "_at" as substring).
+    # Valid temporal patterns: ends with _at, or "date"/"timestamp"/"time" as
+    # a standalone word segment (order_date, timestamp_utc, hire_date).
+    if dtype == "datetime64[ns]" or _TEMPORAL_COL.search(col_lower):
         return "TIMESTAMP_NTZ"
 
     # Float columns
@@ -169,9 +181,11 @@ def infer_schema(csv_path: Path, sample_rows: int = 10_000) -> list[tuple[str, s
     print(f"    Inferring schema from first {sample_rows:,} rows of {csv_path.name} ...")
     df = pd.read_csv(csv_path, nrows=sample_rows, low_memory=False)
 
-    # Try parsing likely datetime columns
+    # Try parsing likely datetime columns.
+    # Use the same word-boundary regex as pandas_dtype_to_sf to avoid false-matching
+    # _attr_ columns (customer_attr_1, emp_attr_1, price_attr_2, etc.)
     for col in df.columns:
-        if any(kw in col.lower() for kw in ["_date","_at","timestamp","_time"]):
+        if _TEMPORAL_COL.search(col.lower()):
             try:
                 df[col] = pd.to_datetime(df[col], errors="coerce", format="mixed")
             except Exception:
@@ -237,7 +251,7 @@ def get_connection_params() -> dict:
         "warehouse": os.environ["SNOWFLAKE_WAREHOUSE"],
         "database":  "SPOTTERPREP_TEST",
         "login_timeout": 60,
-        "network_timeout": 0,      # 0 = unlimited; COPY INTO on large files can run 20+ min
+        "network_timeout": None,   # None = no timeout; 0 means non-blocking (wrong)
     }
     if os.getenv("SNOWFLAKE_ROLE"):
         params["role"] = os.environ["SNOWFLAKE_ROLE"]
@@ -258,9 +272,18 @@ def connect_snowflake(params: dict):
 STAGE_NAME = "SPOTTERPREP_LOAD_STAGE"
 
 def setup_environment(conn, warehouse: str, dry_run: bool = False):
-    """Create database, schemas, warehouse resume, and named internal stage."""
-    statements = [
-        f"USE WAREHOUSE {warehouse};",
+    """Create database, schemas, and named internal stage."""
+    # Warehouse is already set in connection params; USE WAREHOUSE can fail if
+    # the role lacks OPERATE privilege, so we skip it and rely on the connection setting.
+    # ALTER SESSION has no warehouse dependency so it runs first.
+    priority = [
+        # 0 means "no session timeout → fall through to warehouse timeout" in Snowflake.
+        # The SE_DEMO_WH has a warehouse-level limit of 3,600 s (1 hour).
+        # Setting an explicit large value here overrides the warehouse limit.
+        # 86400 = 24 hours, sufficient for the 9 GB DS5 load.
+        "ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 86400;",
+    ]
+    idempotent = [
         "CREATE DATABASE IF NOT EXISTS SPOTTERPREP_TEST;",
         "USE DATABASE SPOTTERPREP_TEST;",
         "CREATE SCHEMA IF NOT EXISTS SPOTTERPREP_TEST.RAW;",
@@ -269,12 +292,21 @@ def setup_environment(conn, warehouse: str, dry_run: bool = False):
         f"  COMMENT = 'Internal stage for SpotterPrep CSV uploads';",
     ]
 
-    for sql in statements:
+    for sql in priority:
         print(f"  SQL: {sql.strip()}")
         if not dry_run:
             conn.cursor().execute(sql)
 
-    print("  Database SPOTTERPREP_TEST, schemas RAW + CLEANED, stage created ✓")
+    for sql in idempotent:
+        print(f"  SQL: {sql.strip()}")
+        if not dry_run:
+            try:
+                conn.cursor().execute(sql)
+            except Exception as e:
+                # IF NOT EXISTS statements — safe to continue if object already exists
+                print(f"  (skipped — {e})")
+
+    print("  Database SPOTTERPREP_TEST, schemas RAW + CLEANED, stage ready ✓")
 
 
 # ── Per-table load ────────────────────────────────────────────────────────
@@ -350,7 +382,10 @@ def load_table(
             qid = cur.sfqid
             print(f"    Query ID: {qid}  (polling for completion ...)")
 
-            from snowflake.connector import QueryStatus
+            try:
+                from snowflake.connector.constants import QueryStatus
+            except ImportError:
+                from snowflake.connector import QueryStatus
             poll_interval = 15   # seconds between status checks
             waited = 0
             while True:
