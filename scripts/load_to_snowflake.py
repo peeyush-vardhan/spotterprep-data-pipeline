@@ -173,7 +173,7 @@ def infer_schema(csv_path: Path, sample_rows: int = 10_000) -> list[tuple[str, s
     for col in df.columns:
         if any(kw in col.lower() for kw in ["_date","_at","timestamp","_time"]):
             try:
-                df[col] = pd.to_datetime(df[col], errors="coerce")
+                df[col] = pd.to_datetime(df[col], errors="coerce", format="mixed")
             except Exception:
                 pass
 
@@ -237,7 +237,7 @@ def get_connection_params() -> dict:
         "warehouse": os.environ["SNOWFLAKE_WAREHOUSE"],
         "database":  "SPOTTERPREP_TEST",
         "login_timeout": 60,
-        "network_timeout": 300,
+        "network_timeout": 0,      # 0 = unlimited; COPY INTO on large files can run 20+ min
     }
     if os.getenv("SNOWFLAKE_ROLE"):
         params["role"] = os.environ["SNOWFLAKE_ROLE"]
@@ -343,8 +343,26 @@ def load_table(
             print(f"    {copy_sql.splitlines()[0]}")
 
         if not dry_run:
+            # Use async execution so the client never holds a blocking socket
+            # waiting for a potentially 20+ minute server-side COPY INTO.
             cur = conn.cursor()
-            cur.execute(copy_sql)
+            cur.execute_async(copy_sql)
+            qid = cur.sfqid
+            print(f"    Query ID: {qid}  (polling for completion ...)")
+
+            from snowflake.connector import QueryStatus
+            poll_interval = 15   # seconds between status checks
+            waited = 0
+            while True:
+                status = conn.get_query_status_throw_if_error(qid)
+                if status == QueryStatus.SUCCESS:
+                    break
+                time.sleep(poll_interval)
+                waited += poll_interval
+                print(f"    ... still running ({waited}s elapsed, status={status.name})")
+
+            # Fetch results now that the query has completed
+            cur.get_results_from_sfqid(qid)
             copy_result = cur.fetchall()
             if verbose:
                 for row in copy_result[:5]:
