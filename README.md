@@ -1,4 +1,4 @@
-# SpotterPrep — Enterprise Data Pipeline
+# SpotterPrep — Enterprise Data Prep Agent
 
 > **4.4M raw rows · 5 business domains · ~19 GB · 10 Snowflake tables · 1,880 columns**
 
