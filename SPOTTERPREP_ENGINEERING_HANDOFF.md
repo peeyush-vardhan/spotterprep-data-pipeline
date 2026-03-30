@@ -17,6 +17,7 @@
 6. [Where AI and LLM Fit In](#6-where-ai-and-llm-fit-in)
 7. [System Architecture for Implementation](#7-system-architecture-for-implementation)
 8. [Appendix — Claude Code Prompts for Further Output Generation](#8-appendix--claude-code-prompts)
+9. [Multi-Iteration Module Integration — Wiring the Three New Modules Together](#9-multi-iteration-module-integration)
 
 ---
 
@@ -1045,6 +1046,340 @@ at config/cleaning_rules.yaml. The format should be:
 This config file should be loadable by a generic cleaning engine that
 applies the rules without dataset-specific code.
 ```
+
+---
+
+## 9. Multi-Iteration Module Integration
+
+Three modules implement the 5-iteration cleaning model described in
+[`docs/multi_iteration_framework.md`](docs/multi_iteration_framework.md).
+This section shows exactly how they connect.
+
+### The Three Modules
+
+| Module | File | What it does |
+|---|---|---|
+| `confidence_scorer` | `scripts/confidence_scorer.py` | Iteration 1 — scans every column, classifies each issue as HIGH / MEDIUM / LOW confidence, returns a structured confidence map |
+| `audit_logger` | `scripts/audit_logger.py` | Iterations 1–5 — append-only JSONL log, one entry per transformation, captures iteration number, rule, confidence score, and approval metadata |
+| `cross_column_validator` | `scripts/cross_column_validator.py` | Iteration 5 — runs after all per-column fixes, detects the 5 cross-column patterns per dataset (stale ML labels, bearing failure, retention risk, accrual-no-reversal, grey market arbitrage) |
+
+### Integration Contract
+
+The modules are stateless — they do not call each other. The calling layer (the chat session, a FastAPI service, or a Snowpark task) owns the session state and passes the confidence map between iterations. The integration flow is:
+
+```
+score_issues()          → confidence_map dict (lives in caller's session state)
+                                  ↓
+[Iteration 2 — context conversation]
+User answers update confidence_map["issues"][n]["confidence_level"]
+and confidence_map["issues"][n]["recommended_action"] directly.
+                                  ↓
+log_transformation()    → one entry per approved action (Iterations 3 and 4)
+                                  ↓
+validate_cross_columns() → list of finding dicts
+log_finding()           → one entry per finding (Iteration 5)
+```
+
+### Full 5-Iteration Flow — Wiring Example
+
+```python
+import pandas as pd
+from scripts.confidence_scorer    import score_issues, print_confidence_report
+from scripts.audit_logger         import AuditLogger
+from scripts.cross_column_validator import validate_cross_columns, print_findings_report
+
+# ── Load the cleaned DataFrame (post-generation, pre-iteration cleaning) ──
+df = pd.read_csv("data/raw/dataset1_customer_orders.csv", nrows=50_000)
+
+# ── Iteration 1: Structural Scan (AI-triggered, zero score impact) ─────────
+confidence_map = score_issues(df, table_name="CUSTOMER_ORDERS", pk_column="order_id")
+print_confidence_report(confidence_map)
+# Output: "I found 14 issues. I'm confident about 6. Can I ask 3 things?"
+
+# ── Iteration 2: Context Conversation (user-triggered, zero score impact) ──
+# The calling layer (chat interface) presents MEDIUM/LOW issues to the user.
+# User answers are written back into the confidence map before iter 3 runs.
+# Example: analyst confirms NPS nulls are opt-outs, not errors.
+for issue in confidence_map["issues"]:
+    if issue["column"] == "nps_score" and issue["issue_type"] == "NULL_PII":
+        issue["confidence_level"]   = "HIGH"
+        issue["recommended_action"] = "PRESERVE_NULL"   # reclassified: legitimate opt-out
+        issue["user_context"]       = "NPS nulls are opt-outs — do not impute"
+
+# ── Iteration 3: High-Confidence Fixes (AI-proposed, user approves) ────────
+logger = AuditLogger(table_name="CUSTOMER_ORDERS")
+
+high_confidence_actions = [
+    {
+        "iteration":        3,
+        "column":           "order_id",
+        "rule_applied":     "DEDUPLICATE_PK",
+        "action":           "DELETE_ROW",
+        "rows_affected":    300,
+        "confidence_score": 0.99,
+        "confidence_level": "HIGH",
+        "approved_by":      "analyst@company.com",
+        "detail":           "300 duplicate order_ids removed, keeping earliest occurrence",
+    },
+    {
+        "iteration":        3,
+        "column":           "onboarding_date>go_live_date",
+        "rule_applied":     "IMPOSSIBLE_TEMPORAL",
+        "action":           "DELETE_ROW",
+        "rows_affected":    45,
+        "confidence_score": 0.97,
+        "confidence_level": "HIGH",
+        "approved_by":      "analyst@company.com",
+        "detail":           "45 rows where onboarding_date > go_live_date — logically impossible",
+    },
+    {
+        "iteration":        3,
+        "column":           "status",
+        "rule_applied":     "CATEGORICAL_INCONSISTENCY",
+        "action":           "STANDARDIZE",
+        "rows_affected":    30_000,
+        "confidence_score": 0.90,
+        "confidence_level": "HIGH",
+        "approved_by":      "analyst@company.com",
+        "original_value":   "active / Active / actv",
+        "new_value":        "ACTIVE",
+        "detail":           "Canonical form ACTIVE confirmed by analyst in Iteration 2",
+    },
+]
+logger.log_batch(high_confidence_actions)
+
+# ── Iteration 4: Ambiguous Resolution (user-driven, one decision at a time) ─
+logger.log_transformation(
+    iteration=4,
+    column="order_amount",
+    rule_applied="NEGATIVE_MONETARY",
+    action="SET_VALUE",
+    rows_affected=12,
+    confidence_score=0.45,
+    confidence_level="LOW",
+    approved_by="analyst@company.com",
+    original_value="negative",
+    new_value="abs(order_amount), order_type='REFUND'",
+    detail="Analyst confirmed: negative amounts are refunds, not entry errors",
+)
+
+# ── Iteration 5: Cross-Column Validation (AI-triggered, auto-runs) ─────────
+findings = validate_cross_columns(df, dataset_name="CUSTOMER_ORDERS")
+print_findings_report(findings, dataset_name="CUSTOMER_ORDERS")
+
+for finding in findings:
+    logger.log_finding(
+        iteration=5,
+        finding_type=finding["finding_type"],
+        columns_involved=finding["columns_involved"],
+        rows_affected=finding["rows_affected"],
+        business_context=finding["business_context"],
+        action="FLAGGED",
+    )
+
+# ── Session summary ────────────────────────────────────────────────────────
+logger.summary()
+# Output: total transformations, rows affected, breakdown by iteration and confidence level
+```
+
+### What the Audit Log Looks Like
+
+Each line in `data/audit_customer_orders.jsonl` is one transformation:
+
+```json
+{
+  "timestamp": "2026-03-18T10:15:30.123Z",
+  "session_id": "SPP-20260318T101500-4821",
+  "table_name": "CUSTOMER_ORDERS",
+  "iteration": 3,
+  "iteration_label": "HIGH_CONFIDENCE_FIXES",
+  "column": "order_id",
+  "rule_applied": "DEDUPLICATE_PK",
+  "action": "DELETE_ROW",
+  "rows_affected": 300,
+  "confidence_score": 0.99,
+  "confidence_level": "HIGH",
+  "approval_mechanism": "user_approved",
+  "approved_by": "analyst@company.com",
+  "approved_at": "2026-03-18T10:15:29.000Z",
+  "original_value": null,
+  "new_value": null,
+  "detail": "300 duplicate order_ids removed, keeping earliest occurrence"
+}
+```
+
+### Architectural Decisions (All P0 / P1 Resolved)
+
+#### Chat Interface
+**Decision: Embedded web app in the ThoughtSpot user journey.**
+
+The SpotterPrep UI is not a standalone product. It surfaces inside ThoughtSpot after the analyst has already connected a table or opened a data model. The trigger is a ThoughtSpot-native prompt: *"Would you like to verify data quality before building?"*
+
+If the analyst accepts, a split-view opens:
+- **Left panel:** The live table — rows and columns, updating visually as transformations are applied
+- **Right panel:** AI chat interaction — the 5-iteration conversation
+
+The session is scoped to one table connection. The ThoughtSpot table connection ID becomes the `session_id` for the state store and the audit log. When the analyst closes the view, the session is persisted so it can be resumed on next open.
+
+Engineering implication: SpotterPrep is a React component (or equivalent) injected into the ThoughtSpot embedding layer, not a separate URL. The backend is a service ThoughtSpot calls. Auth is inherited from the active ThoughtSpot session — no separate login.
+
+---
+
+#### State Persistence
+**Decision: Snowflake VARIANT column — no new infrastructure.**
+
+The confidence map and current iteration state are stored in a Snowflake table as a VARIANT (semi-structured JSON). This keeps all state inside the data warehouse the analyst is already connected to, and makes the state queryable for debugging.
+
+```sql
+-- Add to SPOTTERPREP_TEST.PROFILES schema
+CREATE TABLE SPOTTERPREP_TEST.PROFILES.CLEANING_SESSIONS (
+    session_id         VARCHAR            NOT NULL,
+    table_name         VARCHAR            NOT NULL,
+    iteration_current  NUMBER             DEFAULT 1,
+    confidence_map     VARIANT,           -- full confidence_map dict from score_issues()
+    user_context       VARIANT,           -- analyst answers keyed by issue index
+    created_at         TIMESTAMP_NTZ      DEFAULT CURRENT_TIMESTAMP(),
+    updated_at         TIMESTAMP_NTZ      DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (session_id)
+);
+```
+
+Read/write pattern in the calling layer:
+
+```python
+import snowflake.connector, json
+
+def save_session(conn, session_id: str, table_name: str, iteration: int,
+                 confidence_map: dict, user_context: dict):
+    conn.cursor().execute("""
+        MERGE INTO SPOTTERPREP_TEST.PROFILES.CLEANING_SESSIONS t
+        USING (SELECT %s AS session_id) s ON t.session_id = s.session_id
+        WHEN MATCHED THEN UPDATE SET
+            iteration_current = %s,
+            confidence_map    = PARSE_JSON(%s),
+            user_context      = PARSE_JSON(%s),
+            updated_at        = CURRENT_TIMESTAMP()
+        WHEN NOT MATCHED THEN INSERT
+            (session_id, table_name, iteration_current, confidence_map, user_context)
+            VALUES (%s, %s, %s, PARSE_JSON(%s), PARSE_JSON(%s))
+    """, (session_id, iteration, json.dumps(confidence_map), json.dumps(user_context),
+          session_id, table_name, iteration, json.dumps(confidence_map), json.dumps(user_context)))
+
+def load_session(conn, session_id: str) -> dict | None:
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT iteration_current, confidence_map, user_context
+        FROM SPOTTERPREP_TEST.PROFILES.CLEANING_SESSIONS
+        WHERE session_id = %s
+    """, (session_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {"iteration": row[0], "confidence_map": row[1], "user_context": row[2]}
+```
+
+---
+
+#### Rejected Items in Iteration 3
+**Decision: Free-form override — analyst types an instruction, system confirms before executing.**
+
+When an analyst declines a proposed HIGH-confidence action, a text input opens immediately below that item in the chat panel. The analyst types a free-form instruction. The LLM parses this into a structured transformation spec and presents a single confirmation line before executing.
+
+```
+AI proposes:  "Delete 300 duplicate order_id rows (keep earliest)"
+Analyst:      [Decline]
+Text input:   "Actually keep the most recent version, not the earliest"
+
+LLM output →  confirmation_message:
+              "I'll keep the most recent of each duplicate instead. 300 rows
+               affected. Confirm?"
+
+Analyst:      [Confirm]
+→ Transformation executes
+→ Audit log entry written (iteration=3, approved_by=analyst_id)
+```
+
+The LLM call for override parsing uses the structured output below. If the analyst closes the text input without typing (dismisses the item entirely), nothing is logged and nothing executes. Dismissed items are silently dropped — see audit log policy below.
+
+Declined items that receive a free-form override and are confirmed are logged as **Iteration 3** actions (not Iteration 4), because the approval happened in the context of the Iteration 3 action list.
+
+---
+
+#### Audit Log Policy (POC Stage)
+**Decision: Log executed actions only. Declined-and-dismissed items are not logged.**
+
+| Event | Logged? |
+|---|---|
+| Action executed (any iteration) | Yes |
+| Iteration 3 action declined → override typed → confirmed | Yes (iteration=3) |
+| Iteration 3 action declined → dismissed without override | No |
+| Iteration 5 finding flagged | Yes |
+| Quality score recomputed | No (computed on-the-fly, not stored in log) |
+
+SOX-grade tamper-evident logging (append-only store, authenticated identity, cryptographic chain) is out of scope for the POC. The JSONL file on disk is sufficient for the POC audit trail. Post-POC: migrate `audit_<table>.jsonl` to the `SPOTTERPREP_TEST.PROFILES` schema as a structured table.
+
+---
+
+#### Quality Score Computation
+**Decision: Extracted as a standalone module, callable after each iteration.**
+
+`scripts/quality_scorer.py` provides `compute_quality_score(df, table_name)`. Call it before and after each transformation iteration and use `format_score_delta()` to generate the live feedback line shown in the chat panel.
+
+```python
+from scripts.quality_scorer import compute_quality_score, format_score_delta
+
+score_before = compute_quality_score(df, "CUSTOMER_ORDERS")
+# ... apply Iteration 3 transformations to df ...
+score_after  = compute_quality_score(df, "CUSTOMER_ORDERS")
+chat_message = format_score_delta(score_before, score_after, iteration=3)
+# → "After Iteration 3: 54.1 → 72.8  (+18.7 pts)  Grade: F → C"
+```
+
+---
+
+### LLM Interface Contract
+
+The LLM is called at 6 specific points across the 5 iterations. Everything else — statistical computation, transformation execution, audit logging, score calculation — is deterministic Python.
+
+| Call point | Trigger | Input | Output | Model | Est. tokens |
+|---|---|---|---|---|---|
+| **Iter 1 — scan summary** | End of structural scan | `confidence_map` dict (issues list) | 2–3 sentence natural language summary: issue count, HIGH/MEDIUM/LOW split, "Can I ask N things?" | claude-haiku-4-5 | 500 in / 100 out |
+| **Iter 2a — question generator** | Per MEDIUM/LOW issue | Issue dict + 3 example rows from that column | One targeted question referencing actual data ("Order ORD-00042 has no customer name. Is this expected?") | claude-sonnet-4-6 | 300 in / 80 out |
+| **Iter 2b — answer parser** | Per analyst answer | Question + issue dict + analyst's free-text answer | Structured JSON: `{confidence_level, recommended_action, user_context, reclassify_as_legitimate: bool}` | claude-haiku-4-5 | 400 in / 60 out |
+| **Iter 3 — action plan narrator** | Before presenting action list | List of HIGH-confidence actions with row counts and reasoning | Bulleted narrative: "Here are the 6 changes I'm proposing..." — one line per action | claude-haiku-4-5 | 600 in / 200 out |
+| **Iter 3 — override parser** | When analyst declines + types instruction | Issue dict + analyst's free-text instruction | Structured JSON: `{action, column, transformation_spec, confirmation_message}` | claude-sonnet-4-6 | 400 in / 100 out |
+| **Iter 4 — option generator** | Per MEDIUM/LOW unresolved issue | Issue dict + 5 example rows + dataset context | 2–3 options, each with: action label, what changes, downstream impact | claude-sonnet-4-6 | 500 in / 200 out |
+| **Iter 5 — findings narrator** | Per cross-column finding | Finding dict from `cross_column_validator` | Business intelligence narrative: what it means, why it matters, what to do | claude-sonnet-4-6 | 300 in / 120 out |
+
+**LLM is NOT called for:** Statistical computation, transformation execution, audit logging, score calculation, duplicate detection, null counting, schema inference.
+
+**Call budget per table:** For a 500-column table with 30 detected issues (typical):
+- Iter 1: 1 call
+- Iter 2: up to 20 question calls + 20 parsing calls = 40
+- Iter 3: 1 plan call + up to 5 override calls = 6
+- Iter 4: up to 10 option calls = 10
+- Iter 5: up to 5 findings calls = 5
+- **Total: ~62 calls · Est. cost: $0.15–0.40 per table**
+
+**All LLM calls use the Claude API (`anthropic` Python SDK).** Model selection per call point is fixed in the contract above — do not substitute models without re-validating output quality, as the structured JSON outputs from haiku calls are downstream inputs to deterministic transformation code.
+
+---
+
+### What Needs to Be Built Around These Modules
+
+These three modules are the deterministic core. The calling layer — which engineering needs to design — provides:
+
+| Responsibility | Status | What it needs to do |
+|---|---|---|
+| **Session state store** | Spec complete — DDL above | MERGE into `CLEANING_SESSIONS` after every iteration. Load on session resume. `confidence_map` updated in-place during Iteration 2 as analyst answers arrive. |
+| **Chat interface** | Spec complete — see Architectural Decisions above | Embedded React component in ThoughtSpot. Split-view: table left, chat right. Inherits ThoughtSpot auth. Triggers on table connection open. |
+| **LLM layer** | Spec complete — see LLM Interface Contract above | 7 call points, models and I/O specified. Use `anthropic` Python SDK. All calls are O(issues), not O(rows). |
+| **Quality score recompute** | Built — `scripts/quality_scorer.py` | Call `compute_quality_score(df, table_name)` before and after each iteration. Use `format_score_delta()` to generate the live feedback message in the chat panel. |
+| **Approval gate** | Spec complete — see Rejected Items above | Iteration 3: present full action list, block execution until analyst approves or overrides each item. Free-form overrides go through LLM override parser → confirmation line → execute. Log only on confirmed execution. |
+
+See [`docs/multi_iteration_framework.md`](docs/multi_iteration_framework.md) for the full product spec,
+including score progression per dataset, LLM call budget, and engineering implementation requirements
+per iteration.
 
 ---
 

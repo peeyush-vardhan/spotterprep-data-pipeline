@@ -318,16 +318,24 @@ spotterprep-data-pipeline/
 │   ├── gen_dataset4.py                        ← FINANCIAL_LEDGER (1M rows, 480 cols)
 │   ├── gen_dataset5.py                        ← PRODUCT_CATALOG (2M rows, chunked)
 │   ├── load_to_snowflake.py                   ← Core loader: PUT + COPY INTO
-│   └── run_remaining_loads.sh                 ← Orchestration shell script
+│   ├── run_remaining_loads.sh                 ← Orchestration shell script
+│   ├── confidence_scorer.py                   ← Iteration 1: issue confidence classification
+│   ├── audit_logger.py                        ← Append-only JSONL transformation log
+│   ├── cross_column_validator.py              ← Iteration 5: cross-column pattern detection
+│   └── quality_scorer.py                      ← 5-dimension quality scoring
 │
 ├── data/                                      ← gitignored, generated locally
 │   ├── raw/                                   ← 5 dirty CSVs (~19 GB)
 │   └── cleaned/                               ← 5 cleaned CSVs
 │
+├── prototype/
+│   └── index.html                             ← Interactive ThoughtSpot UI demo (open in browser)
+│
 ├── docs/
 │   ├── architecture.md                        ← Full system design
 │   ├── quality_framework.md                   ← 5-dimension scoring methodology
 │   ├── bug_postmortem.md                      ← Schema inference incident report
+│   ├── multi_iteration_framework.md           ← 5-iteration confidence-gated cleaning model
 │   └── images/                                ← Pipeline/architecture diagrams
 │
 └── sql/
@@ -351,6 +359,7 @@ spotterprep-data-pipeline/
 | Snowflake access | Connection details + SQL to verify every table |
 | Sprint order | 5 sprints, each with a specific dataset as acceptance criteria |
 | Process appendix | Why each domain was chosen, what each injected issue tests |
+| Multi-iteration cleaning | 5-iteration confidence-gated loop, score progression per dataset. See [`docs/multi_iteration_framework.md`](docs/multi_iteration_framework.md) |
 
 ---
 
