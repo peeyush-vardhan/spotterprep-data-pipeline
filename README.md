@@ -336,6 +336,7 @@ spotterprep-data-pipeline/
 │   ├── quality_framework.md                   ← 5-dimension scoring methodology
 │   ├── bug_postmortem.md                      ← Schema inference incident report
 │   ├── multi_iteration_framework.md           ← 5-iteration confidence-gated cleaning model
+│   ├── ai_interaction_design_brief.md         ← Human-AI control model and UX design rationale
 │   └── images/                                ← Pipeline/architecture diagrams
 │
 └── sql/
