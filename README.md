@@ -1,20 +1,20 @@
-# SpotterPrep — Enterprise Data Prep Agent
+# SpotterPrep — AI Data Preparation Agent
 
-> **4.4M raw rows · 5 business domains · ~19 GB · 10 Snowflake tables · 1,880 columns**
+An AI that automatically cleans enterprise data sounds useful. It isn't.
 
-A production-grade synthetic data pipeline built to validate [SpotterPrep](https://thoughtspot.com) — an agentic system that takes raw Snowflake tables and produces clean, context-enriched data ready for ThoughtSpot Spotter AI. Covers the full lifecycle: data generation → quality profiling → decision-tree cleaning → Snowflake loading → engineering handoff.
+When an AI cleans a table without explanation, analysts spend their time auditing the output instead of cleaning the data. The work doesn't go away — it shifts from cleaning to verification. Net time saved: near zero. Trust in the output: low. Adoption: zero.
+
+**SpotterPrep is built on a different thesis:** the AI should do the computation, and the analyst should own every non-trivial decision. The output carries the analyst's judgment. That's the thing they'll stake their reputation on.
+
+This means the AI scans first and asks before it touches anything. It presents concrete examples, not statistics. It proposes fixes only after the analyst has answered the questions that make those fixes safe. And there is a hard list of things it will never do automatically — monetary fields, PII, physics violations, SOX-relevant accounting entries — regardless of confidence score.
+
+The result: analysts who feel like *they* cleaned the data, with AI doing the work.
 
 ---
 
-<!-- Once you have a pipeline diagram, drop it at docs/images/pipeline.png and uncomment:
-![SpotterPrep Pipeline Architecture](docs/images/pipeline.png)
--->
-
-## The Problem This Solves
-
-Data analysts spend **60–80% of their time cleaning data** before running a single query. SpotterPrep automates that process end-to-end — profiling raw Snowflake tables, detecting quality issues across 5 dimensions, applying a domain-aware decision tree, and producing cleaned outputs with full audit trails and context generation for Spotter.
-
-This repository is the **validation layer**: 4.4 million rows of realistic, intentionally dirty enterprise data, cleaned and loaded into Snowflake as side-by-side raw/cleaned pairs — proving the decision tree works at scale before a single line of product code is written.
+> **Validation:** 4.4M rows · 5 enterprise datasets · ~19 GB · 10 Snowflake tables · 1,880 columns
+> Average quality lift: **59.1 → 93.9** (Grade D → A) across all datasets
+> Interactive prototype: [`prototype/index.html`](prototype/index.html) — open in browser, no setup
 
 ---
 
