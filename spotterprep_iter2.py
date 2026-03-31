@@ -28,6 +28,8 @@ import sys
 import time
 from pathlib import Path
 
+import re
+
 import anthropic
 import pandas as pd
 
@@ -38,6 +40,37 @@ from scripts.confidence_scorer import score_issues, print_confidence_report
 # ── Model ────────────────────────────────────────────────────────────────────
 
 MODEL = "claude-sonnet-4-6"
+
+# ── PII sanitisation ─────────────────────────────────────────────────────────
+# Issue types and column name patterns that must never send raw values to the LLM.
+# The LLM receives column metadata and statistics — never actual PII or monetary values.
+# See docs/pii_handling_policy.md for the full policy and rationale.
+
+_REDACT_ISSUE_TYPES = {"NULL_PII", "NULL_MONETARY", "NEGATIVE_MONETARY"}
+
+_REDACT_COL = re.compile(
+    r'amount|price|revenue|cost|salary|pay|fee|charge|balance|debit|credit|arr|mrr|ltv|cac'
+    r'|(?:^|_)(?:name|email|phone|address|ssn|dob|birth|passport)(?:_|$)'
+    r'|account.?number|employee.?id|patient.?id|ip.?address',
+    re.I,
+)
+
+
+def _sanitise_for_llm(issue: dict) -> dict:
+    """
+    Return a copy of the issue that is safe to include in an LLM prompt.
+
+    Redacts example_values for PII and monetary columns. All other fields
+    (column name, issue type, counts, issue detail) are always safe — they
+    are metadata, not personal data.
+
+    The original issue dict in the confidence map is never modified.
+    """
+    if issue["issue_type"] in _REDACT_ISSUE_TYPES or _REDACT_COL.search(issue["column"]):
+        safe = issue.copy()
+        safe["example_values"] = ["[redacted — PII or monetary column]"]
+        return safe
+    return issue
 
 # ── System prompts ───────────────────────────────────────────────────────────
 
@@ -138,17 +171,18 @@ def _estimate_score(confidence_map: dict) -> tuple[float, str]:
 # ── LLM helpers ──────────────────────────────────────────────────────────────
 
 def _generate_question(client: anthropic.Anthropic, issue: dict, table_name: str) -> str:
-    examples = issue.get("example_values") or []
+    safe = _sanitise_for_llm(issue)
+    examples = safe.get("example_values") or []
     example_str = f"Example values from actual data: {examples}" if examples else ""
 
     prompt = f"""Table: {table_name}
-Column: {issue['column']}
-Issue type: {issue['issue_type']}
-Rows affected: {issue['count']:,} ({issue['pct']:.1%} of table)
-Issue detail: {issue['detail']}
+Column: {safe['column']}
+Issue type: {safe['issue_type']}
+Rows affected: {safe['count']:,} ({safe['pct']:.1%} of table)
+Issue detail: {safe['detail']}
 {example_str}
-Confidence level: {issue['confidence_level']}
-Current recommended action: {issue['recommended_action']}
+Confidence level: {safe['confidence_level']}
+Current recommended action: {safe['recommended_action']}
 
 Ask one targeted question to understand the business context for this issue."""
 
@@ -168,13 +202,14 @@ def _parse_answer(
     answer: str,
     table_name: str,
 ) -> dict:
+    safe = _sanitise_for_llm(issue)
     prompt = f"""Table: {table_name}
-Column: {issue['column']}
-Issue type: {issue['issue_type']}
-Issue detail: {issue['detail']}
-Example values: {issue.get('example_values', [])}
-Current confidence level: {issue['confidence_level']}
-Current recommended action: {issue['recommended_action']}
+Column: {safe['column']}
+Issue type: {safe['issue_type']}
+Issue detail: {safe['detail']}
+Example values: {safe.get('example_values', [])}
+Current confidence level: {safe['confidence_level']}
+Current recommended action: {safe['recommended_action']}
 
 Question that was asked: {question}
 Analyst's answer: {answer}
