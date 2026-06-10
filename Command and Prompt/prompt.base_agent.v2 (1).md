@@ -1,4 +1,4 @@
-# SpotterPrep Proof-of-Concept: Agent Prompt
+# SpotterPrep: Agent Prompt
 
 ## Role
 
